@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-PDF Chatbot</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+        #chatbox { width: 50%; margin: auto; border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: auto; }
+        input { width: 50%; padding: 10px; margin-top: 10px; }
+        button { padding: 10px; margin-left: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+    <h2>Multi-PDF Conversational Chatbot</h2>
+    <div id="chatbox"></div>
+    
+    <input type="text" id="question" placeholder="Ask a question...">
+    <button onclick="sendMessage()">Send</button>
+
+    <script>
+        function sendMessage() {
+            let question = document.getElementById("question").value;
+            let chatbox = document.getElementById("chatbox");
+            
+            if (question.trim() === "") return;
+
+            chatbox.innerHTML += `<p><b>You:</b> ${question}</p>`;
+            document.getElementById("question").value = "";
+
+            fetch("http://localhost:5000/chat", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ question: question })
+            })
+            .then(response => response.json())
+            .then(data => {
+                chatbox.innerHTML += `<p><b>Bot:</b> ${data.answer}</p>`;
+                chatbox.scrollTop = chatbox.scrollHeight;
+            })
+            .catch(error => console.error("Error:", error));
+        }
+    </script>
+
+</body>
+</html>
