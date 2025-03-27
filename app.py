@@ -1,214 +1,129 @@
 import os
+import pickle
+import fitz  # PyMuPDF
+from sentence_transformers import SentenceTransformer
 import numpy as np
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_core.embeddings import Embeddings
-from langchain_groq import ChatGroq
-from langchain.chains import RetrievalQA
-from sklearn.feature_extraction.text import TfidfVectorizer
+from groq import Groq
+from sklearn.metrics.pairwise import cosine_similarity
 
+def extract_text_from_pdf(pdf_path):
+    """Extract text from a PDF file."""
+    doc = fitz.open(pdf_path)
+    text = "\n".join([page.get_text("text") for page in doc])
+    return text
 
+def chunk_text(text, chunk_size=2000):
+    """Divide text into chunks of specified size."""
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    return chunks
 
-class CustomTFIDFEmbeddings(Embeddings):
+def generate_embeddings(chunks, model_name="all-MiniLM-L6-v2", cache_dir="embeddings_cache"):
     """
-    Custom Embeddings class using TF-IDF vectorization
-    """
-    def __init__(self, max_features=1000):
-        """
-        Initialize TF-IDF Vectorizer
-        
-        Args:
-            max_features (int): Maximum number of features
-        """
-        self.vectorizer = TfidfVectorizer(max_features=max_features)
-        self._fitted = False
-
-    def fit(self, texts):
-        """
-        Fit the vectorizer to the given texts
-        
-        Args:
-            texts (List[str]): List of texts to fit
-        """
-        self.vectorizer.fit(texts)
-        self._fitted = True
-
-    def embed_documents(self, texts):
-        """
-        Embed a list of documents
-        
-        Args:
-            texts (List[str]): List of text documents to embed
-        
-        Returns:
-            List[List[float]]: List of embeddings
-        """
-        if not self._fitted:
-            self.fit(texts)
-        return self.vectorizer.transform(texts).toarray().tolist()
-
-    def embed_query(self, text):
-        """
-        Embed a query text
-        
-        Args:
-            text (str): Text to embed
-        
-        Returns:
-            List[float]: Embedding of the text
-        """
-        if not self._fitted:
-            raise ValueError("Embeddings must be fitted before querying")
-        return self.vectorizer.transform([text]).toarray()[0].tolist()
-
-class PDFChatbot:
-    def __init__(self, pdf_paths, groq_api_key):
-        """
-        Initialize PDF Chatbot with Groq Llama model
-        
-        Args:
-            pdf_paths (list): List of PDF file paths
-            groq_api_key (str): Groq API key
-        """
-        # Set Groq API Key
-        os.environ["GROQ_API_KEY"] = groq_api_key
-        
-        # Load and process PDFs
-        self.retriever = self._load_multiple_pdfs(pdf_paths)
-        
-        # Initialize Groq Llama model
-        self.llm = ChatGroq(
-            temperature=0.2,  # Low temperature for more focused responses
-            model_name="llama2-70b-4096"  # Groq's Llama 2 70B model
-        )
-        
-        # Create QA chain
-        if self.retriever is not None:
-            self.qa_chain = RetrievalQA.from_chain_type(
-                llm=self.llm, 
-                chain_type="stuff", 
-                retriever=self.retriever,
-                return_source_documents=True
-            )
-        else:
-            self.qa_chain = None
-            print("Warning: No retriever created. Chatbot may not function correctly.")
+    Generate vector embeddings for each text chunk with caching mechanism.
     
-    def _load_multiple_pdfs(self, pdf_paths):
-        """
-        Load and process multiple PDF files
-        
-        Args:
-            pdf_paths (list): List of PDF file paths
-        
-        Returns:
-            Retriever object or None
-        """
-        try:
-            all_documents = []
-            all_texts = []
-
-            for pdf_path in pdf_paths:
-                if not os.path.exists(pdf_path):
-                    print(f"Warning: PDF file {pdf_path} not found!")
-                    continue
-                
-                loader = PyMuPDFLoader(pdf_path)
-                documents = loader.load()
-                all_documents.extend(documents)
-                
-                # Extract text for embeddings
-                all_texts.extend([doc.page_content for doc in documents])
-
-            # Check if any documents were loaded
-            if not all_documents:
-                raise ValueError("No documents could be loaded from the PDF files")
-
-            # Split text into chunks
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000, 
-                chunk_overlap=200
-            )
-            docs = text_splitter.split_documents(all_documents)
-
-            # Use TF-IDF embeddings
-            embeddings = CustomTFIDFEmbeddings()
-            
-            # Fit embeddings on all text
-            embeddings.fit(all_texts)
-
-            # Store embeddings in FAISS
-            vectorstore = FAISS.from_documents(docs, embeddings)
-
-            return vectorstore.as_retriever()
-        
-        except Exception as e:
-            print(f"Error loading PDFs: {e}")
-            return None
-
-# Initialize Flask App
-app = Flask(__name__)
-
-CORS(app)
-
-# Configuration (use environment variables in production)
-GROQ_API_KEY = ""
-PDF_FILES = ["pdf1.pdf"]
-
-# Create Chatbot Instance
-try:
-    chatbot = PDFChatbot(PDF_FILES, GROQ_API_KEY)
-except Exception as e:
-    print(f"Failed to initialize chatbot: {e}")
-    chatbot = None
-
-@app.route('/chat', methods=['POST'])
-def chat():
+    Args:
+        chunks (list): List of text chunks
+        model_name (str): Name of the embedding model
+        cache_dir (str): Directory to store cached embeddings
+    
+    Returns:
+        tuple: (embeddings, chunks)
     """
-    Chat endpoint to handle user questions
-    """
-    # Check if chatbot is initialized
-    if chatbot is None or chatbot.qa_chain is None:
-        return jsonify({"error": "Chatbot not properly initialized"}), 500
-
+    # Create cache directory if it doesn't exist
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Generate a unique cache filename based on the chunks
+    import hashlib
+    chunks_hash = hashlib.md5(''.join(chunks).encode()).hexdigest()
+    cache_filename = os.path.join(cache_dir, f"{model_name}_{chunks_hash}_embeddings.pkl")
+    
+    # Check if cached embeddings exist
+    if os.path.exists(cache_filename):
+        print("Loading embeddings from cache...")
+        with open(cache_filename, 'rb') as f:
+            return pickle.load(f)
+    
+    # If no cache, generate embeddings
     try:
-        # Get question from request
-        data = request.json
-        if not data or 'question' not in data:
-            return jsonify({"error": "No question provided"}), 400
-
-        question = data['question']
+        print("Generating embeddings...")
+        model = SentenceTransformer(model_name)
+        embeddings = model.encode(chunks, convert_to_numpy=True)
         
-        # Run the query
-        result = chatbot.qa_chain({"query": question})
+        # Cache the embeddings
+        with open(cache_filename, 'wb') as f:
+            pickle.dump((embeddings, chunks), f)
         
-        return jsonify({
-            "answer": result['result'],
-            "source_documents": [
-                {
-                    "page_content": doc.page_content,
-                    "metadata": doc.metadata
-                } for doc in result.get('source_documents', [])
-            ]
-        })
-    
+        return embeddings, chunks
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error generating embeddings: {e}")
+        return None, None
 
-@app.route('/health', methods=['GET'])
-def health_check():
+def retrieve_relevant_chunks_knn(query, chunks, embeddings, k=5, model_name="all-MiniLM-L6-v2"):
     """
-    Health check endpoint
+    Retrieve the k most relevant chunks using K-Nearest Neighbors approach.
+    
+    Args:
+        query (str): Search query
+        chunks (list): Original text chunks
+        embeddings (numpy.ndarray): Pre-computed embeddings
+        k (int): Number of nearest neighbors to retrieve
+        model_name (str): Embedding model name
+    
+    Returns:
+        list: K most relevant chunks
     """
-    return jsonify({
-        "status": "healthy", 
-        "model": "Groq Llama2-70B",
-        "pdf_files_loaded": len(PDF_FILES),
-        "chatbot_initialized": chatbot is not None
-    }), 200
+    try:
+        model = SentenceTransformer(model_name)
+        query_embedding = model.encode(query, convert_to_numpy=True).reshape(1, -1)
+        
+        # Compute cosine similarities
+        similarities = cosine_similarity(query_embedding, embeddings)[0]
+        
+        # Get indices of top k most similar chunks
+        top_k_indices = similarities.argsort()[-k:][::-1]
+        
+        # Return the corresponding chunks
+        return [chunks[idx] for idx in top_k_indices]
+    except Exception as e:
+        print(f"Error retrieving relevant chunks: {e}")
+        return []
 
-if __name__ == '__main__':
-    app.run(debug=True)
+def query_llama_groq(prompt, model_name="llama3-70b-8192", api_key="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"):
+    """Query LLaMA-3 using Groq API."""
+    client = Groq(api_key=api_key)
+
+    chat_completion = client.chat.completions.create(
+    messages=[
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Synthesize information from multiple context chunks to provide a comprehensive answer. Use the context to provide a detailed answer.",
+        },
+        {
+            "role": "user",
+            "content": prompt,
+        }
+    ],
+    model="llama-3.3-70b-versatile",
+    )
+    return chat_completion.choices[0].message.content
+
+if __name__ == "__main__":
+    pdf_path = "pdf1.pdf"  # Change this to your actual PDF file path
+    extracted_text = extract_text_from_pdf(pdf_path)
+    text_chunks = chunk_text(extracted_text)
+    
+    # Generate embeddings
+    chunk_embeddings, chunks = generate_embeddings(text_chunks)
+    
+    if chunk_embeddings is not None:
+        query = "Give me information in the document about karnataka"
+        
+        # Retrieve top 5 most relevant chunks
+        relevant_chunks = retrieve_relevant_chunks_knn(query, chunks, chunk_embeddings, k=5)
+        
+        # Combine chunks into a single context
+        combined_context = " ".join(relevant_chunks)
+        
+        # Generate response using combined context
+        llm_response = query_llama_groq(f"Based on these context chunks: {combined_context}, answer: {query}")
+        print(f"LLM Response:\n{llm_response}\n")
